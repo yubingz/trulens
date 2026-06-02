@@ -61,6 +61,11 @@ class GroundTruthAgreement(
 
     ground_truth_imp: Optional[Callable] = pydantic.Field(None, exclude=True)
 
+    conversation_id: Optional[str] = None
+    """Optional default conversation ID to scope ground truth lookups.
+    Per-call conversation_id arguments (on recall_at_k, mrr, etc.) override this.
+    """
+
     model_config: ClassVar[pydantic.ConfigDict] = pydantic.ConfigDict(
         arbitrary_types_allowed=True
     )
@@ -72,6 +77,7 @@ class GroundTruthAgreement(
         ],
         provider: Optional[llm_provider.LLMProvider] = None,
         bert_scorer: Optional["BERTScorer"] = None,
+        conversation_id: Optional[str] = None,
         **kwargs,
     ):
         """Measures Agreement against a Ground Truth.
@@ -138,6 +144,10 @@ class GroundTruthAgreement(
             bert_scorer: Internal Usage for
                 DB serialization.
 
+            conversation_id: Optional default conversation ID to scope
+                ground truth lookups. Per-call conversation_id arguments
+                (on recall_at_k, mrr, etc.) override this default.
+
         """
         if provider is None:
             warnings.warn(
@@ -187,6 +197,7 @@ class GroundTruthAgreement(
             ground_truth_imp=ground_truth_imp,
             provider=provider,
             bert_scorer=bert_scorer,
+            conversation_id=conversation_id,
             **kwargs,
         )
 
@@ -205,10 +216,13 @@ class GroundTruthAgreement(
             return None
 
     def _find_golden_context_chunks_and_scores(
-        self, prompt: str
+        self, prompt: str, conversation_id: Optional[str] = None
     ) -> Optional[List[Tuple[str, float]]]:
         if self.ground_truth_imp is not None:
             return self.ground_truth_imp(prompt)
+
+        # Determine effective conversation_id: per-call arg overrides instance default
+        effective_conv_id = conversation_id if conversation_id is not None else getattr(self, "conversation_id", None)
 
         golden_context_chunks = [
             (
@@ -218,6 +232,7 @@ class GroundTruthAgreement(
             for qr in self.ground_truth
             for chunk in qr["expected_chunks"]
             if qr["query"] == prompt
+            and (effective_conv_id is None or qr.get("conversation_id") == effective_conv_id)
         ]
         if golden_context_chunks:
             return golden_context_chunks
@@ -374,21 +389,27 @@ class GroundTruthAgreement(
         retrieved_context_chunks: List[str],
         relevance_scores: Optional[List[float]] = None,
         k: Optional[int] = None,
+        conversation_id: Optional[str] = None,
     ) -> float:
         """
         Compute Precision@k for a given query and retrieved context chunks, considering tie handling.
+
+        Low precision signals that irrelevant memories were retrieved — the
+        "irrelevant memories" signal discussed in #2524.
 
         Args:
             query (str): The input query string.
             retrieved_context_chunks (List[str]): List of retrieved context chunks.
             relevance_scores (Optional[List[float]]): Relevance scores for each retrieved chunk.
             k (Optional[int]): Rank position up to which to compute Precision. If None, compute for all retrieved chunks.
+            conversation_id (Optional[str]): Conversation ID to scope ground truth lookups.
+                Overrides the instance-level conversation_id default.
 
         Returns:
-            float: Computed Precision@k score.
+            float: Computed Precision@k score, or np.nan if no ground truth found.
         """
         ground_truth_context_chunks = (
-            self._find_golden_context_chunks_and_scores(query)
+            self._find_golden_context_chunks_and_scores(query, conversation_id=conversation_id)
         )
         if ground_truth_context_chunks:
             k = k or len(retrieved_context_chunks)
@@ -435,21 +456,30 @@ class GroundTruthAgreement(
         retrieved_context_chunks: List[str],
         relevance_scores: Optional[List[float]] = None,
         k: Optional[int] = None,
+        conversation_id: Optional[str] = None,
     ) -> float:
         """
         Compute Recall@k for a given query and retrieved context chunks, considering tie handling.
 
+        Also supports memory recall evaluation: pass memory texts as
+        retrieved_context_chunks and use expected_chunks in the golden set
+        to store expected memory texts. Use conversation_id to scope lookups
+        to a specific conversation when the golden set contains multiple
+        conversations.
+
         Args:
             query (str): The input query string.
-            retrieved_context_chunks (List[str]): List of retrieved context chunks.
+            retrieved_context_chunks (List[str]): List of retrieved context chunks (or retrieved memory texts for memory recall).
             relevance_scores (Optional[List[float]]): Relevance scores for each retrieved chunk.
             k (Optional[int]): Rank position up to which to compute Recall. If None, compute for all retrieved chunks.
+            conversation_id (Optional[str]): Conversation ID to scope ground truth lookups.
+                Overrides the instance-level conversation_id default.
 
         Returns:
-            float: Computed Recall@k score.
+            float: Computed Recall@k score, or np.nan if no ground truth found.
         """
         ground_truth_context_chunks = (
-            self._find_golden_context_chunks_and_scores(query)
+            self._find_golden_context_chunks_and_scores(query, conversation_id=conversation_id)
         )
         if ground_truth_context_chunks:
             k = k or len(retrieved_context_chunks)
@@ -495,19 +525,26 @@ class GroundTruthAgreement(
         query: str,
         retrieved_context_chunks: List[str],
         relevance_scores: Optional[List[float]] = None,
+        conversation_id: Optional[str] = None,
     ) -> float:
         """
         Compute Mean Reciprocal Rank (MRR) for a given query and retrieved context chunks.
 
+        Also supports memory MRR evaluation: use conversation_id to scope
+        lookups when the golden set contains multiple conversations.
+
         Args:
             query (str): The input query string.
             retrieved_context_chunks (List[str]): List of retrieved context chunks.
+            relevance_scores (Optional[List[float]]): Relevance scores for each retrieved chunk.
+            conversation_id (Optional[str]): Conversation ID to scope ground truth lookups.
+                Overrides the instance-level conversation_id default.
 
         Returns:
-            float: Computed MRR score.
+            float: Computed MRR score, or np.nan if no ground truth found.
         """
         ground_truth_context_chunks = (
-            self._find_golden_context_chunks_and_scores(query)
+            self._find_golden_context_chunks_and_scores(query, conversation_id=conversation_id)
         )
         if ground_truth_context_chunks:
             # Extract ground truth chunks
